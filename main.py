@@ -3,77 +3,24 @@ from groq import Groq
 import PyPDF2
 import json
 import os
+import urllib.parse
 from dotenv import load_dotenv
+import requests
+from bs4 import BeautifulSoup
+from jobspy import scrape_jobs
 import pandas as pd
-import io
 import time
-from datetime import datetime
-import zipfile
-import google.generativeai as genai
-import base64
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION INITIALE ---
 load_dotenv()
 api_key = os.getenv("GROQ_API_KEY")
-gemini_key = os.getenv("GEMINI_API_KEY")
+ft_client_id = os.getenv("FRANCE_TRAVAIL_CLIENT_ID")
+ft_client_secret = os.getenv("FRANCE_TRAVAIL_CLIENT_SECRET")
 
 if not api_key:
     st.error("⚠️ Clé API GROQ non trouvée. Veuillez vérifier votre fichier .env")
 
 client = Groq(api_key=api_key) if api_key else None
-
-if gemini_key:
-    genai.configure(api_key=gemini_key)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash') 
-else:
-    st.warning("⚠️ Clé API GEMINI non trouvée. L'analyse d'images et de PDFs complexes sera désactivée.")
-    gemini_model = None
-
-def normalize_columns(df):
-    """Normalise les noms de colonnes pour qu'ils soient reconnus par l'application."""
-    col_map = {
-        'Date': ['date', 'date opération', 'date op', 'dateop', 'valeur', 'jour'],
-        'Libellé': ['libellé', 'libelle', 'description', 'désignation', 'libelleop', 'détails', 'motif', 'objet'],
-        'Montant': ['montant', 'valeur', 'somme', 'montantop', 'total', 'euro', 'prix'],
-        'Débit': ['débit', 'debit', 'dépenses', 'sorties', 'paiement'],
-        'Crédit': ['crédit', 'credit', 'recettes', 'entrées', 'versement']
-    }
-    
-    # Nettoyage des noms actuels (minuscules et sans espaces)
-    current_cols = {str(c).strip().lower(): c for c in df.columns}
-    
-    for target, variations in col_map.items():
-        if target in df.columns: continue
-        for var in variations:
-            if var in current_cols:
-                df[target] = df[current_cols[var]]
-                break
-    return df
-
-def clean_amount(val):
-    """Nettoie et convertit une valeur en float robuste."""
-    if pd.isna(val) or val == "": return 0.0
-    if isinstance(val, (int, float)): return float(val)
-    
-    # Remove spaces, currency symbols and common separators
-    s = str(val).upper().replace(' ', '').replace('€', '').replace('\xa0', '').replace('\u202f', '').replace('\u00a0', '')
-    is_neg = "-" in s or "(" in s or "DEBIT" in s
-    
-    # Gestion des séparateurs de milliers (1.234,56 ou 1,234.56)
-    if ',' in s and '.' in s:
-        if s.rfind(',') > s.rfind('.'):
-            s = s.replace('.', '') # Le point est le millier
-        else:
-            s = s.replace(',', '') # La virgule est le millier
-            
-    # Garde chiffres, points et virgules pour la conversion finale
-    cleaned = "".join(c for c in s if c.isdigit() or c in ".,")
-    if not cleaned: return 0.0
-    
-    try:
-        amount = float(cleaned.replace(',', '.'))
-        return -amount if is_neg else amount
-    except ValueError: return 0.0
 
 def extract_text_from_pdf(file):
     """Extrait le texte d'un fichier PDF de manière sécurisée."""
@@ -92,137 +39,291 @@ def extract_text_from_pdf(file):
         st.error(f"Erreur lors de la lecture du PDF : {e}")
         return None
 
-def handle_zip_file(uploaded_file, target_exts):
-    """Extrait les fichiers d'un ZIP correspondant à l'extension voulue."""
-    extracted_files = []
-    try:
-        with zipfile.ZipFile(uploaded_file) as z:
-            for file_name in z.namelist():
-                if file_name.lower().endswith(target_exts):
-                    with z.open(file_name) as f:
-                        content = io.BytesIO(f.read())
-                        content.name = file_name # Simulation de l'attribut name
-                        extracted_files.append(content)
-        return extracted_files
-    except Exception as e:
-        st.error(f"Erreur ZIP : {e}")
-        return []
+def clean_job_title(title):
+    """Nettoie le titre du poste pour optimiser la recherche (le dénominateur optimisé)."""
+    if not title: return ""
+    clean = title.lower()
+    # Suppression des mentions inutiles pour les moteurs de recherche
+    for word in ['h/f', 'f/h', 'hf', 'fh', 'métier:']:
+        clean = clean.replace(word, ' ')
+    # On ne garde que la partie principale avant les séparateurs
+    for sep in [',', '(', '-', ':', '&', '/', '|']:
+        clean = clean.split(sep)[0]
+    return " ".join(clean.split()).capitalize()
 
-def analyze_invoice_ai(file_data, mime_type, text_content=None):
-    """Utilise l'IA (Groq ou Gemini) pour extraire les informations clés d'une facture."""
-    prompt = """
-    Tu es un expert comptable. Analyse ce document (facture ou reçu) et extrait les informations en JSON :
-    {
-        "fournisseur": "nom",
-        "date": "YYYY-MM-DD",
-        "total_ttc": 0.0,
-        "tva": 0.0,
-        "categorie": "Loyer/Transport/Logiciel/etc",
-        "description": "bref résumé"
-    }
-    Réponds uniquement avec l'objet JSON, sans texte additionnel.
-    Si une info est manquante, mets null.
-    """
+def analyze_cv(text):
+    """Envoie le texte à Groq et parse la réponse JSON."""
+    if not client:
+        return None
     
-    # 1. Essai avec Groq si texte disponible (PDF numérique)
-    if text_content and client:
-        try:
-            chat_completion = client.chat.completions.create(
-                messages=[{"role": "user", "content": f"{prompt}\n\nTexte du document :\n{text_content}"}],
-                model="llama-3.3-70b-versatile",
-                response_format={"type": "json_object"},
-            )
-            return json.loads(chat_completion.choices[0].message.content)
-        except Exception:
-            pass
-
-    if not gemini_model:
-        return None
-
-    try:
-        response = gemini_model.generate_content([
-            prompt,
-            {'mime_type': mime_type, 'data': file_data}
-        ])
-        if not response.parts:
-            st.error("L'IA n'a pas pu générer de réponse (possiblement bloquée par les filtres de sécurité).")
-            return None
-        # Nettoyage pour s'assurer d'avoir un JSON valide
-        clean_text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_text)
-    except Exception as e:
-        st.error(f"Erreur d'analyse IA : {e}")
-        return None
-
-def analyze_bank_statement_ai(file_data, mime_type, text_content=None):
-    """Utilise l'IA (Groq ou Gemini) pour extraire la liste des transactions d'un relevé bancaire."""
-    prompt = """
-    Tu es un expert comptable. Analyse ce relevé bancaire et extrait la liste de TOUTES les transactions sous forme de tableau JSON.
-    Chaque objet du tableau doit avoir exactement ces clés :
-    {
-        "Date": "YYYY-MM-DD",
-        "Libellé": "description complète de l'opération",
-        "Montant": "-12.50" (utilise un signe moins pour les dépenses, pas de signe pour les recettes)
-    }
-    Réponds uniquement avec le tableau JSON [ ... ], sans texte avant ou après.
-    """
-    
-    # 1. Essai avec Groq si texte disponible
-    if text_content and client:
-        try:
-            chat_completion = client.chat.completions.create(
-                messages=[{"role": "user", "content": f"{prompt}\n\nTexte du relevé :\n{text_content}"}],
-                model="llama-3.3-70b-versatile",
-                response_format={"type": "json_object"},
-            )
-            return json.loads(chat_completion.choices[0].message.content)
-        except Exception as e:
-            st.warning(f"Groq a échoué pour le relevé... {e}")
-
-    if not gemini_model:
-        return None
-
-    try:
-        response = gemini_model.generate_content([
-            prompt,
-            {'mime_type': mime_type, 'data': file_data}
-        ])
-        clean_text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_text)
-    except Exception as e:
-        st.error(f"Erreur d'analyse du relevé : {e}")
-        return None
-
-def get_mime_type(filename):
-    ext = filename.lower()
-    if ext.endswith(".pdf"): return "application/pdf"
-    if ext.endswith(".png"): return "image/png"
-    if ext.endswith(".jpg") or ext.endswith(".jpeg"): return "image/jpeg"
-    if ext.endswith(".csv"): return "text/csv"
-    return "application/octet-stream"
-
-def categorize_bank_labels(unmatched_rows):
-    """Demande à l'IA de catégoriser les lignes sans factures par lot."""
-    if not client or not unmatched_rows: return {}
-    labels = [r['Libellé'] for r in unmatched_rows]
     prompt = f"""
-    En tant qu'expert comptable, catégorise ces libellés bancaires. 
-    Utilise ces catégories : Ventes, Loyer, Logiciel, Transport, Alimentation, Salaire, Impôts, Divers.
-    Retourne UNIQUEMENT un JSON : {{"libellé": "catégorie"}}
-    
-    Libellés : {labels}
+    Tu es un expert en recrutement. Analyse ce CV et retourne uniquement un objet JSON avec les clés suivantes :
+    "nom_complet", "contact", "metier", "mots_cles" (liste de chaînes), "resume" (maximum 3 lignes), "annees_experience" (nombre entier), "recommandations_metiers" (liste de 5 métiers suggérés), "metiers_alternatifs" (liste de 3 métiers radicalement différents utilisant les mêmes compétences transférables).
+
+    LOGIQUE D'IDENTIFICATION DU MÉTIER :
+    - Si le profil contient des métiers multiples (ex: "Consultant & Développeur"), NE les regroupe PAS.
+    - Sélectionne le métier le plus porteur/pertinent pour une recherche d'emploi actuelle comme "metier" principal.
+    - Place le second métier (ou les métiers connexes identifiés) en priorité absolue au début de la liste "recommandations_metiers".
+
+    Texte du CV :
+    {text}
     """
+    
     try:
         chat_completion = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
             model="llama-3.3-70b-versatile",
             response_format={"type": "json_object"},
         )
         return json.loads(chat_completion.choices[0].message.content)
-    except: return {}
+    except json.JSONDecodeError as je:
+        st.error(f"L'IA n'a pas renvoyé un JSON valide : {je}")
+        return None
+    except Exception as e:
+        st.error(f"Détails de l'erreur API : {str(e)}")
+        return None
+
+def generate_cover_letter(cv_data, job_title, company, job_description=""):
+    """Génère une lettre de motivation personnalisée via Groq."""
+    if not client or not cv_data:
+        return None
+
+    prompt = f"""
+    Tu es un expert en recrutement. Rédige une lettre de motivation percutante, professionnelle et personnalisée.
+    
+    INFORMATIONS DU CANDIDAT :
+    - Nom : {cv_data.get('nom_complet')}
+    - Contact : {cv_data.get('contact')}
+    - Métier : {cv_data.get('metier')}
+    - Compétences : {', '.join(cv_data.get('mots_cles', []))}
+    - Expérience : {cv_data.get('annees_experience')} ans
+    - Résumé : {cv_data.get('resume')}
+
+    INFORMATIONS DU POSTE :
+    - Titre : {job_title}
+    - Entreprise : {company}
+    - Description (si dispo) : {job_description}
+
+    La lettre doit être structurée (Vous/Moi/Nous), montrer une réelle adéquation entre le profil et le poste, et rester concise.
+    Utilise les informations de contact pour l'en-tête et signe la lettre avec le nom du candidat. Réponds uniquement par le texte de la lettre, sans commentaires additionnels.
+    """
+    
+    try:
+        completion = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile",
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        st.error(f"Erreur lors de la génération de la lettre : {e}")
+        return None
+
+def generate_job_search_links(job_title, keywords):
+    """Génère des URLs de recherche pour différentes plateformes."""
+    query = job_title
+    encoded_query = urllib.parse.quote(query)
+    
+    return {
+        "Welcome to the Jungle": f"https://www.welcometothejungle.com/fr/jobs?query={encoded_query}",
+        "HelloWork": f"https://www.hellowork.com/fr-fr/emploi/recherche.html?k={encoded_query}",
+        "Meteojob": f"https://www.meteojob.com/jobsearch/search?what={encoded_query}",
+        "Jobijoba": f"https://www.jobijoba.com/fr/recherche?q={encoded_query}",
+        "Service Public (FR)": f"https://www.choisirleservicepublic.gouv.fr/nos-offres/filtres/mots-cles/{encoded_query}/",
+        "We Work Remotely (Global)": f"https://weworkremotely.com/remote-jobs/search?term={encoded_query}",
+        "Remote OK (Global)": f"https://remoteok.com/remote-{encoded_query.replace('%20', '-')}-jobs",
+        "Working Nomads (Global)": f"https://www.workingnomads.com/remote-jobs?search={encoded_query}",
+        "Remotive (Global)": f"https://remotive.com/remote-jobs?search={encoded_query}",
+        "EuroJobs (Europe)": f"https://www.eurojobs.com/index.php?job_title={encoded_query}&location=",
+        "Indeed (USA)": f"https://www.indeed.com/jobs?q={encoded_query}",
+        "Indeed (UK)": f"https://uk.indeed.com/jobs?q={encoded_query}",
+        "Indeed (Canada)": f"https://ca.indeed.com/jobs?q={encoded_query}",
+        "StepStone (Allemagne)": f"https://www.stepstone.de/jobs/{encoded_query.replace('%20', '-')}",
+        "Seek (Australie)": f"https://www.seek.com.au/{encoded_query.replace('%20', '-')}-jobs",
+        "Idealist (Impact)": f"https://www.idealist.org/en/jobs?q={encoded_query}"
+    }
+
+def scrape_france_travail_jobs(job_title, limit=10):
+    """Alternative par Scraping si l'API n'est pas disponible."""
+    # Nettoyage du titre pour la recherche (on retire les parenthèses et détails superflus)
+    clean_title = job_title.lower().replace('h/f', '').replace('métier:', '').strip()
+    clean_title = clean_title.split(',')[0].split('(')[0].split('-')[0].strip()
+    
+    query = urllib.parse.quote(clean_title)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
+    
+    jobs = []
+    page = 1
+    try:
+        session = requests.Session()
+        while len(jobs) < limit and page <= 5:
+            url = f"https://candidat.pole-emploi.fr/offres/recherche?motsCles={query}&offresPartenaires=true&page={page}&sort=1"
+            response = session.get(url, headers=headers, timeout=10)
+            if response.status_code != 200: break
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            items = soup.select('li.result-resumes-item, article.offre, li[data-id-offre]')
+            
+            if not items:
+                items = soup.select('div[class*="offre"], article.result, .media-body')
+            
+            if not items: break
+
+            for item in items:
+                if len(jobs) >= limit: break
+                title_elem = item.select_one('h2.media-heading, .t4, .t5, a.titre, .media-heading')
+                company_elem = item.select_one('p.sub-text, .nom-entreprise, span.entreprise')
+                link_elem = item.select_one('a[href*="detail"], a.btn-detail-offre')
+                
+                if title_elem:
+                    href = link_elem['href'] if link_elem else "#"
+                    jobs.append({
+                        "titre": title_elem.get_text(strip=True),
+                        "entreprise": company_elem.get_text(strip=True) if company_elem else "Entreprise non précisée",
+                        "lien": "https://candidat.pole-emploi.fr" + href if href.startswith('/') else href
+                    })
+            page += 1
+        return jobs
+    except Exception as e:
+        return jobs
+
+def chercher_offres_jobspy(metier, contrat_label, remote_only, location="France, FR", num_results=5, experience=None):
+    """Recherche des offres via JobSpy sur plusieurs plateformes."""
+    # Mapping des types de contrat pour JobSpy
+    job_type_map = {"CDI": "fulltime", "CDD": "contract", "Interim": "temporary"}
+    
+    clean_metier = clean_job_title(metier)
+    if not clean_metier:
+        clean_metier = metier
+
+    # Sites à scanner (Indeed et LinkedIn sont les plus fiables en France)
+    sites_to_try = ["indeed", "linkedin", "google", "glassdoor", "zip_recruiter", "simplyhired", "careerbuilder", "monster"]
+    all_results = pd.DataFrame()
+
+    for site in sites_to_try:
+        try:
+            time.sleep(1)  # Délai pour réduire les risques de bannissement IP
+            search_location = location if location else "France"
+            
+            # Configuration de base
+            search_params = {
+                "site_name": [site],
+                "search_term": clean_metier,
+                "location": search_location,
+                "results_wanted": num_results,
+                "hours_old": 720,
+                "job_type": job_type_map.get(contrat_label),
+                "is_remote": remote_only,
+                "enforce_desktop": True
+            }
+
+            if site == "indeed":
+                search_params["country_indeed"] = "france"
+            elif site == "linkedin":
+                search_params["linkedin_fetch_full_description"] = False
+                if "," in search_location: search_params["location"] = search_location.split(",")[0]
+            elif site in ["google", "glassdoor", "zip_recruiter", "simplyhired"]:
+                # Ces sites préfèrent souvent "France" tout court plutôt que "France, FR"
+                if "France" in search_location: search_params["location"] = "France"
+            
+            results = scrape_jobs(**search_params)
+            
+            # Fallback 1 : On retire le filtre de type de contrat
+            if (results is None or results.empty) and "job_type" in search_params:
+                search_params.pop("job_type")
+                results = scrape_jobs(**search_params)
+            
+            # Fallback 2 : On retire la limite temporelle
+            if (results is None or results.empty) and "hours_old" in search_params:
+                search_params.pop("hours_old")
+                results = scrape_jobs(**search_params)
+
+            # Fallback 3 : Recherche ultra-simplifiée (Titre brut)
+            if (results is None or results.empty):
+                search_params["search_term"] = metier # On utilise le titre non nettoyé
+                # On garde results_wanted tel quel pour avoir un maximum de retours
+                results = scrape_jobs(**search_params)
+
+            if results is not None and not results.empty:
+                all_results = pd.concat([all_results, results], ignore_index=True)
+                
+            # On continue la boucle pour interroger toutes les sources et remplir le dashboard, 
+            # sauf si on a vraiment un volume massif d'offres (ex: 3x le demandé)
+            if len(all_results) >= num_results * 3:
+                break
+
+        except Exception:
+            # On ignore l'erreur spécifique à un site pour ne pas bloquer les autres
+            continue
+            
+    if all_results.empty:
+        st.info("💡 Note : Les plateformes externes (LinkedIn, Indeed...) bloquent souvent les requêtes automatiques. Privilégiez France Travail ou les liens d'accès direct.")
+        
+    return all_results
+
+def get_france_travail_token():
+    """Récupère le token OAuth2 pour l'API France Travail."""
+    if not ft_client_id or not ft_client_secret:
+        return None
+
+    auth_url = "https://entreprise.pole-emploi.fr/connexion/oauth2/access_token?realm=%2Fpartenaire"
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": str(ft_client_id).strip(),
+        "client_secret": str(ft_client_secret).strip(),
+        "scope": "api_offresdemploiv2 o2dso"
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    try:
+        response = requests.post(auth_url, data=data, headers=headers, timeout=10)
+        response.raise_for_status()
+        return response.json().get("access_token")
+    except Exception as e:
+        if "ft_token_error" not in st.session_state:
+            st.sidebar.error(f"Erreur France Travail Auth: {e}")
+            st.session_state["ft_token_error"] = True
+        return None
+
+def get_france_travail_jobs_api(job_title, limit=10):
+    """Récupère les offres via l'API officielle."""
+    token = get_france_travail_token()
+    if not token:
+        return []
+
+    search_url = "https://api.pole-emploi.io/partenaire/offresdemploi/v2/offres/search"
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {
+        "motsCles": job_title,
+        "range": f"0-{limit-1}"
+    }
+    
+    try:
+        response = requests.get(search_url, headers=headers, params=params)
+        if response.status_code == 204: # Pas de contenu
+            return []
+        response.raise_for_status()
+        
+        results = response.json().get("resultats", [])
+        jobs = []
+        for res in results:
+            jobs.append({
+                "titre": res.get("intitule"),
+                "entreprise": res.get("entreprise", {}).get("nom", "Confidentiel"),
+                "lien": f"https://candidat.pole-emploi.fr/offres/recherche/detail/{res.get('id')}"
+            })
+        return jobs
+    except Exception as e:
+        st.error(f"Erreur lors de l'appel API France Travail : {e}")
+        return []
 
 # --- INTERFACE STREAMLIT ---
-st.set_page_config(page_title="My Accounter AI", page_icon="💰", layout="wide")
+st.set_page_config(page_title="Find me a job AI", page_icon="🚀", layout="centered")
 
 # --- STYLE CSS PERSONNALISÉ ---
 st.markdown("""
@@ -254,167 +355,251 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("💰 My Accounter AI")
-st.markdown("#### Votre comptabilité simplifiée par l'Intelligence Artificielle")
+st.title("🚀 Find me a job AI")
+st.markdown("#### Trouvez votre prochain emploi avec l'aide de l'IA")
 
 # --- INITIALISATION DE L'ÉTAT ---
-if 'bank_data' not in st.session_state: st.session_state['bank_data'] = None
-if 'invoices' not in st.session_state: st.session_state['invoices'] = []
+if 'search_query' not in st.session_state:
+    st.session_state['search_query'] = ""
 
 with st.sidebar:
     st.header("⚙️ Paramètres")
-    st.info("Uploadez vos documents pour générer votre bilan.")
-    if st.button("Réinitialiser les données"):
-        st.session_state['bank_data'] = None
-        st.session_state['invoices'] = []
-        st.rerun()
+    num_ads = st.slider("Nombre d'annonces à afficher", min_value=1, max_value=50, value=10)
+    contrat = st.selectbox("Type de contrat", ["CDI", "CDD", "Interim"])
+    ville = st.text_input("📍 Ville / Département", value="France")
+    remote = st.checkbox("Télétravail uniquement")
 
-col1, col2 = st.columns(2)
+uploaded_file = st.file_uploader("📂 Glissez-déposez votre CV ici (PDF uniquement)", type="pdf")
 
-with col1:
-    st.subheader("🏦 Relevé Bancaire (CSV, PDF, Images)")
-    bank_files = st.file_uploader("Upload CSV(s), PDF(s), Image(s) ou ZIP", type=["csv", "zip", "pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
-    if bank_files and st.button("Charger les relevés"):
-        all_dfs = []
-        valid_bank_exts = ('.csv', '.pdf', '.png', '.jpg', '.jpeg')
-        
-        for f in bank_files:
-            files_to_process = [f] if f.name.lower().endswith(valid_bank_exts) else handle_zip_file(f, valid_bank_exts)
-            for b_f in files_to_process:
-                if b_f.name.lower().endswith('.csv'):
-                    try:
-                        df_temp = pd.read_csv(b_f, sep=None, engine='python')
-                        df_temp = normalize_columns(df_temp)
-                        all_dfs.append(df_temp)
-                    except:
-                        st.error(f"Erreur sur le fichier CSV {b_f.name}")
-                else:
-                    with st.spinner(f"Analyse IA du relevé : {b_f.name}..."):
-                        m_type = get_mime_type(b_f.name)
-                        # Si b_f est un BytesIO (depuis ZIP), on utilise getvalue(), sinon read()
-                        file_content = b_f.getvalue() if hasattr(b_f, 'getvalue') else b_f.read()
-                        
-                        # Extraction de texte pour Groq
-                        txt = extract_text_from_pdf(b_f) if m_type == "application/pdf" else None
-                        data = analyze_bank_statement_ai(file_content, m_type, text_content=txt)
-                        if data:
-                            df_temp = pd.DataFrame(data)
-                            df_temp = normalize_columns(df_temp)
-                            all_dfs.append(df_temp)
-        
-        if all_dfs:
-            st.session_state['bank_data'] = pd.concat(all_dfs, ignore_index=True)
-            st.success(f"✅ {len(all_dfs)} relevé(s) consolidé(s) !")
-
-with col2:
-    st.subheader("🧾 Factures & Reçus (PDF, PNG, JPG)")
-    invoice_files_input = st.file_uploader("Upload PDF(s), Image(s) ou ZIP", type=["pdf", "zip", "png", "jpg", "jpeg"], accept_multiple_files=True)
-    if invoice_files_input and st.button("Lancer l'analyse IA"):
-        # Collecte de tous les documents (directs ou dans ZIP)
-        all_docs = []
-        valid_exts = ('.pdf', '.png', '.jpg', '.jpeg')
-        for f in invoice_files_input:
-            if f.name.lower().endswith(valid_exts):
-                all_docs.append(f)
-            elif f.name.lower().endswith('.zip'):
-                all_docs.extend(handle_zip_file(f, valid_exts))
-
-        with st.spinner("L'IA analyse vos factures..."):
-            new_invoices = 0
-            for file in all_docs:
-                # Éviter de traiter deux fois le même fichier
-                if any(inv.get('filename') == file.name for inv in st.session_state['invoices']):
-                    continue
-                    
-                # Préparation des données pour Gemini (plus besoin d'extraire le texte manuellement)
-                file_bytes = file.getvalue()
-                m_type = get_mime_type(file.name)
-
-                # Extraction de texte pour Groq
-                txt = extract_text_from_pdf(file) if m_type == "application/pdf" else None
-                data = analyze_invoice_ai(file_bytes, m_type, text_content=txt)
+if uploaded_file is not None:
+    # On crée un identifiant unique pour le fichier pour éviter de re-analyser inutilement
+    file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+    if st.session_state.get('last_processed_file') != file_id:
+        with st.spinner("Analyse du document en cours..."):
+            cv_text = extract_text_from_pdf(uploaded_file)
+            if cv_text:
+                data = analyze_cv(cv_text)
                 if data:
-                    data['filename'] = file.name
-                    st.session_state['invoices'].append(data)
-                    new_invoices += 1
-            st.success(f"✨ {new_invoices} nouvelles factures ajoutées !")
+                    st.session_state['user_cv_data'] = data
+                    st.session_state['search_query'] = clean_job_title(data.get("metier", ""))
+                    st.session_state['last_processed_file'] = file_id
+                    st.success("Analyse réussie !")
+                    st.divider()
+            else:
+                st.warning("Impossible d'extraire du texte de ce PDF.")
 
-# --- TRAITEMENT & RECONCILIATION ---
-if st.session_state['bank_data'] is not None:
-    st.divider()
-    st.header("📊 Analyse du Bilan Professionnel")
-    
-    df = st.session_state['bank_data']
-    invoices = st.session_state['invoices']
-    
-    # Vérification de sécurité
-    critical_cols = ['Date', 'Libellé']
-    if not any(c in df.columns for c in critical_cols):
-        st.warning("⚠️ Les colonnes du relevé n'ont pas été reconnues. Vérifiez les titres de votre fichier CSV.")
+# --- AFFICHAGE DU PROFIL ---
+if 'user_cv_data' in st.session_state:
+    data = st.session_state['user_cv_data']
 
-    results = []
-    for idx, row in df.iterrows():
-        if 'Débit' in df.columns or 'Crédit' in df.columns:
-            d = clean_amount(row.get('Débit', row.get('Debit', 0)))
-            c = clean_amount(row.get('Crédit', row.get('Credit', 0)))
-            montant_net = c if abs(c) > 0 else -abs(d)
-        else: montant_net = clean_amount(row.get('Montant', 0))
+    if data.get("nom_complet"):
+        st.header(f"👤 {data['nom_complet']}")
+    if data.get("contact"):
+        st.caption(f"📩 {data['contact']}")
 
-        match = None
-        abs_montant = abs(montant_net)
-        for inv in invoices:
-            if abs(inv.get('total_ttc', 0) - abs_montant) < 0.05:
-                match = inv
-                break
+    col_profil, col_pistes = st.columns([1, 1])
+
+    with col_profil:
+        st.subheader("📋 Mon Profil")
+        st.markdown(f"**Métier :** {data.get('metier', 'Non spécifié')}")
+        st.markdown(f"**Expérience :** {data.get('annees_experience', 0)} an(s)")
+        st.info(data.get("resume", "Pas de résumé disponible."))
+        keywords = data.get("mots_cles", [])
+        st.write(" ".join([f"`{kw}`" for kw in keywords]))
+
+    with col_pistes:
+        st.subheader("💡 Pistes d'évolution")
+        for i, r in enumerate(data.get("recommandations_metiers", [])):
+            if st.button(f"🔍 {r}", key=f"reco_{i}", use_container_width=True):
+                st.session_state['search_query'] = r
+                st.session_state['trigger_search'] = True
+                st.rerun()
         
-        results.append({
-            "Date": row.get('Date', 'N/A'),
-            "Libellé": row.get('Libellé', 'N/A'),
-            "Montant": montant_net,
-            "Statut": "✅ Lié" if match else "❌ Manquant",
-            "Facture": match.get('filename') if match else "-",
-            "Catégorie": match.get('categorie') if match else "À définir"
-        })
+        st.subheader("🔀 Métiers Alternatifs")
+        st.caption("Basés sur vos compétences transférables")
+        for i, r in enumerate(data.get("metiers_alternatifs", [])):
+            if st.button(f"🔄 {r}", key=f"alt_{i}", use_container_width=True):
+                st.session_state['search_query'] = r
+                st.session_state['trigger_search'] = True
+                st.rerun()
 
-    # Catégorisation intelligente pour les manquants
-    unmatched = [r for r in results if r['Statut'] == "❌ Manquant"]
-    if unmatched and st.button("🪄 Catégoriser intelligemment les manquants"):
-        with st.spinner("L'IA catégorise vos dépenses sans factures..."):
-            ai_cats = categorize_bank_labels(unmatched)
-            for r in results:
-                if r['Statut'] == "❌ Manquant" and r['Libellé'] in ai_cats:
-                    r['Catégorie'] = ai_cats[r['Libellé']]
-        st.rerun()
-
-    # --- AFFICHAGE COMPTE DE RÉSULTAT ---
-    res_df = pd.DataFrame(results)
-    
-    st.subheader("📊 Compte de Résultat (Simplifié)")
-    col_res1, col_res2 = st.columns(2)
-    
-    with col_res1:
-        st.markdown("**Produits (Recettes)**")
-        recettes_df = res_df[res_df['Montant'] > 0].groupby('Catégorie')['Montant'].sum().reset_index()
-        if recettes_df.empty: st.write("Aucune recette détectée.")
-        else: st.table(recettes_df.style.format({'Montant': '{:.2f} €'}))
-        
-    with col_res2:
-        st.markdown("**Charges (Dépenses)**")
-        depenses_df = res_df[res_df['Montant'] < 0].groupby('Catégorie')['Montant'].sum().abs().reset_index()
-        if depenses_df.empty: st.write("Aucune dépense détectée.")
-        else: st.table(depenses_df.style.format({'Montant': '{:.2f} €'}))
-
-    st.subheader("🔍 Détail des opérations")
-    st.dataframe(res_df.style.applymap(lambda x: 'color: red' if x == "❌ Manquant" else 'color: green', subset=['Statut']), use_container_width=True)
-
-    # --- RÉSUMÉ FINANCIER ---
     st.divider()
-    c1, c2, c3 = st.columns(3)
-    total_depenses = abs(res_df[res_df['Montant'] < 0]['Montant'].sum())
-    total_recettes = res_df[res_df['Montant'] > 0]['Montant'].sum()
-    
-    c1.metric("Total Recettes", f"{total_recettes:.2f} €")
-    c2.metric("Total Dépenses", f"{total_depenses:.2f} €")
-    c3.metric("Bilan (Net)", f"{(total_recettes - total_depenses):.2f} €", delta=f"{(total_recettes - total_depenses):.2f} €")
+    with st.expander("Voir les données brutes"):
+        st.json(data)
 
-st.caption("My Accounter AI - Propulsé par Streamlit, Gemini 1.5 Flash & Llama 3.3")
+# --- SECTION DE RECHERCHE D'OFFRES ---
+st.divider()
+st.subheader("🔍 Recherche d'opportunités")
+st.info("Modifiez l'intitulé ci-dessous pour lancer une recherche personnalisée.")
+
+# Préparation des options de recherche (Métier principal + Recommandations)
+search_options = []
+if 'user_cv_data' in st.session_state:
+    cv_data = st.session_state['user_cv_data']
+    primary = clean_job_title(cv_data.get("metier", ""))
+    recos = [clean_job_title(r) for r in cv_data.get("recommandations_metiers", [])]
+    # On crée une liste unique en gardant l'ordre
+    search_options = list(dict.fromkeys([primary] + recos))
+
+col_input, col_btn = st.columns([2, 1])
+with col_input:
+    if search_options:
+        manual_query = st.selectbox("Métier cible :", 
+                                    options=search_options, 
+                                    index=search_options.index(st.session_state['search_query']) if st.session_state['search_query'] in search_options else 0,
+                                    label_visibility="collapsed")
+    else:
+        manual_query = st.text_input("Métier recherché :", value=st.session_state['search_query'], label_visibility="collapsed")
+
+with col_btn:
+    launch_search = st.button("🚀 Rechercher", use_container_width=True)
+
+# Déclenchement automatique si on a cliqué sur une suggestion
+if st.session_state.get('trigger_search'):
+    launch_search = True
+    st.session_state['trigger_search'] = False
+
+# Initialisation de l'état pour les résultats
+if 'offres' not in st.session_state:
+    st.session_state['offres'] = None
+if 'job_ads_ft' not in st.session_state:
+    st.session_state['job_ads_ft'] = None
+
+if launch_search and manual_query:
+    with st.spinner(f"Scan global des plateformes en cours..."):
+        exp_val = st.session_state.get('user_cv_data', {}).get('annees_experience')
+        
+        # 1. On cherche sur JobSpy (LinkedIn, Indeed, etc.)
+        res_jobspy = chercher_offres_jobspy(manual_query, contrat, remote, location=ville, num_results=num_ads, experience=exp_val)
+        st.session_state['offres'] = res_jobspy
+        
+        # 2. Tentative API, puis repli automatique sur Scraping si erreur ou pas d'ID
+        st.session_state['job_ads_ft'] = []
+        if ft_client_id and ft_client_secret:
+            st.session_state['job_ads_ft'] = get_france_travail_jobs_api(manual_query, limit=num_ads)
+        
+        if not st.session_state['job_ads_ft']:
+            st.session_state['job_ads_ft'] = scrape_france_travail_jobs(manual_query, limit=num_ads)
+
+# --- TABLEAU DE BORD DES SOURCES ---
+if st.session_state['offres'] is not None or st.session_state['job_ads_ft'] is not None:
+    st.divider()
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader("📊 État du Scan Global (Résultats intégrés)")
+    
+    # Extraction des statistiques
+    js_df = st.session_state['offres']
+    js_counts = js_df['site'].value_counts().to_dict() if js_df is not None and not js_df.empty else {}
+    ft_count = len(st.session_state['job_ads_ft']) if st.session_state['job_ads_ft'] else 0
+    
+    # Configuration des sources à afficher
+    source_list = [
+        ("linkedin", "LinkedIn"),
+        ("indeed", "Indeed"),
+        ("glassdoor", "Glassdoor"),
+        ("google", "Google Jobs"),
+        ("zip_recruiter", "ZipRecruiter"),
+        ("simplyhired", "SimplyHired"),
+        ("careerbuilder", "CareerBuilder"),
+        ("monster", "Monster"),
+        ("france_travail", "FT / Pôle Emploi")
+    ]
+    
+    # Affichage en grille 4x2 pour mobile et desktop
+    rows = [source_list[i:i + 4] for i in range(0, len(source_list), 4)]
+    for row in rows:
+        status_cols = st.columns(len(row))
+        for idx, (key, label) in enumerate(row):
+            count = js_counts.get(key, 0) if key != "france_travail" else ft_count
+            color = "#d4edda" if count > 0 else "#f8d7da"
+            icon = "✅" if count > 0 else "❌"
+            status_cols[idx].markdown(f"""
+                <div style="text-align:center; padding:8px; border-radius:8px; background-color:{color}; border:1px solid rgba(0,0,0,0.1); margin-bottom:5px;">
+                    <small style="font-size:0.75rem;">{label}</small><br><b>{icon} {count}</b>
+                </div>
+            """, unsafe_allow_html=True)
+
+    # --- NOUVELLE SECTION : ACCÈS DIRECT ---
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader("🚀 Accès Direct (Autres plateformes)")
+    st.caption("Ces plateformes protègent leurs données contre l'IA, mais nous avons optimisé vos liens de recherche pour un accès rapide :")
+    
+    links = generate_job_search_links(manual_query, [])
+    link_rows = [list(links.items())[i:i + 3] for i in range(0, len(links), 3)]
+    for row in link_rows:
+        cols = st.columns(len(row))
+        for i, (name, url) in enumerate(row):
+            cols[i].link_button(f"🔍 {name}", url, use_container_width=True)
+
+# Affichage des résultats (en dehors du bloc 'if launch_search')
+if st.session_state['offres'] is not None and not st.session_state['offres'].empty:
+    offres = st.session_state['offres']
+    st.success(f"{len(offres)} offres trouvées via le scanner multi-plateformes")
+
+    for _, row in offres.iterrows():
+        job_id = f"job_{row.get('id', row.get('job_url'))}"
+        with st.container(border=True):
+            st.markdown(f"### {row.get('title', 'Poste sans titre')}")
+            st.markdown(f"🏢 **{row.get('company', 'Entreprise inconnue')}**")
+            st.markdown(f"📍 {row.get('location', 'Lieu non précisé')}")
+            st.caption(f"🏷️ Source : **{row.get('site', 'Plateforme').capitalize()}**")
+
+            btn_c1, btn_c2 = st.columns(2)
+            with btn_c1:
+                st.link_button("🌐 Voir l'offre", row.get('job_url', '#'), use_container_width=True)
+            with btn_c2:
+                expander_letter = st.expander("📝 Lettre")
+            with expander_letter:
+                if 'user_cv_data' not in st.session_state:
+                    st.warning("Veuillez d'abord uploader votre CV.")
+                else:
+                    # On stocke la lettre dans le state pour qu'elle reste affichée après génération
+                    letter_key = f"letter_{job_id}"
+                    if st.button(f"Générer la lettre (IA)", key=f"btn_{job_id}"):
+                        with st.spinner("Rédaction en cours..."):
+                            desc = row.get('description', "")
+                            letter = generate_cover_letter(st.session_state['user_cv_data'], row['title'], row['company'], desc)
+                            if letter:
+                                st.session_state[letter_key] = letter
+                    
+                    if letter_key in st.session_state:
+                        st.text_area("Votre lettre personnalisée :", value=st.session_state[letter_key], height=400, key=f"area_{job_id}")
+                        st.download_button("Télécharger la lettre (.txt)", st.session_state[letter_key], file_name=f"lettre_{row.get('company', 'entreprise')}.txt", key=f"dl_{job_id}")
+
+# Affichage séparé pour France Travail
+if st.session_state.get('job_ads_ft'):
+    st.subheader("🇫🇷 Offres France Travail")
+    for ad in st.session_state['job_ads_ft']:
+        job_id_ft = f"ft_{hash(ad['lien'])}"
+        with st.container(border=True):
+            st.markdown(f"### {ad['titre']}")
+            st.markdown(f"🏢 **{ad['entreprise']}**")
+            
+            btn_ft_c1, btn_ft_c2 = st.columns(2)
+            with btn_ft_c1:
+                st.link_button("🌐 Voir l'offre France Travail", ad['lien'], use_container_width=True)
+            with btn_ft_c2:
+                expander_letter_ft = st.expander("📝 Lettre")
+            
+            with expander_letter_ft:
+                if 'user_cv_data' not in st.session_state:
+                    st.warning("Veuillez d'abord uploader votre CV.")
+                else:
+                    letter_key_ft = f"letter_{job_id_ft}"
+                    if st.button(f"Générer la lettre (IA)", key=f"btn_{job_id_ft}"):
+                        with st.spinner("Rédaction en cours..."):
+                            letter = generate_cover_letter(st.session_state['user_cv_data'], ad['titre'], ad['entreprise'], "")
+                            if letter:
+                                st.session_state[letter_key_ft] = letter
+                    
+                    if letter_key_ft in st.session_state:
+                        st.text_area("Votre lettre personnalisée :", value=st.session_state[letter_key_ft], height=400, key=f"area_{job_id_ft}")
+                        st.download_button("Télécharger la lettre (.txt)", st.session_state[letter_key_ft], file_name=f"lettre_{ad['entreprise']}.txt", key=f"dl_{job_id_ft}")
+            
+            st.caption("Source : France Travail (Pôle Emploi)")
+
+# Message d'alerte si rien n'est trouvé après une recherche
+if st.session_state['offres'] is not None and st.session_state['offres'].empty and not st.session_state.get('job_ads_ft'):
+    st.warning("⚠️ Aucune offre trouvée. Essayez de simplifier l'intitulé du métier ou de changer la ville.")
+
+st.caption("Propulsé par Streamlit, Groq & Llama 3")
